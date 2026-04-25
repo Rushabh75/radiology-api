@@ -1,83 +1,66 @@
-# Relevant Priors — Experiment Write-Up
-
-## Problem Statement
-
-Given a patient's **current radiology examination** and a list of their **prior examinations**, predict which priors a radiologist would want to see while reading the current study.
-
-Input: `study_description` strings (e.g. `"CT CHEST WITH CONTRAST"`)
-Output: `predicted_is_relevant: true | false` for each prior
-
----
+# Relevant Priors — Write-Up
 
 ## Approach
 
-### Architecture: Two-Stage Pipeline
+The deployed system is a **pure rule-based classifier** — no LLM, no external API calls.
+Every prediction is deterministic and runs in under 1 second for a full batch.
 
-```
-For each prior:
-  1. Rule-based classifier  →  confident? (score ≥ 0.70 or ≤ 0.30)  →  return result
-                            →  uncertain? (0.30–0.70)                →  queue for LLM
-  2. Batched LLM call (ONE call per case, all uncertain priors)
-     LLM failure → rule-based fallback
-```
+### How it works
 
-### Stage 1 — Rule-Based Classifier (`classifier.py`)
+For each (current exam, prior exam) pair:
 
-**Region extraction** via regex over 25 canonical body regions:
+1. **Extract body region(s)** from the study description using regex patterns over 25 canonical regions: `brain`, `chest`, `cardiac`, `breast`, `abdomen`, `abdomen_pelvis`, `pelvis`, `spine_cervical`, `spine_thoracic`, `spine_lumbar`, `spine_whole`, `thyroid`, `upper_extremity`, `lower_extremity`, `hip`, `vascular_head`, `vascular_chest`, `vascular_abdomen`, `vascular_peripheral`, `neck_soft_tissue`, `neck_us`, `bone_density`, `whole_body`, `gi_tract`, `msk_general`
 
-| Region | Example descriptions matched |
-|---|---|
-| `brain` | `CT HEAD`, `MRI BRAIN`, `CT head/brain`, `NE EEG Request` |
-| `cardiac` | `ECHO 2D`, `TTE`, `LUM TTE`, `CT FFR`, `NM myo perf`, `CT angio coronary` |
-| `chest` | `CT CHEST`, `XR Chest 1V`, `NM pul perfusion`, `THORACENTESIS` |
-| `breast` | `MAM screen`, `MAMMOGRAPHY SCREENING BILATERAL`, `DIGITAL SCREENER W CAD`, `Seed Localization` |
-| `abdomen` | `CT ABD`, `US ABDOMINAL`, `CHOLANGIOGRAM`, `PARACENTESIS`, `NEPHROSTOMY`, `RENAL COLIC` |
-| `spine_lumbar` | `MRI LUMBAR SPINE`, `CT lumbar spine`, `LUMBAR SPINE LIMITED VIEWS` |
-| `whole_body` | `PET/CT`, `BONE SCAN`, `NM bone scan`, `PET-CT SKULL TO THIGH` |
-| `vascular_head` | `CAROTID ULTRASOUND`, `CT angio carotid`, `VAS transcranial doppler` |
+2. **Extract modality** (MRI, CT, X-ray, US, NM, mammo, DXA, fluoro, angio)
 
-**Key deduplication rules** applied after extraction:
-- `abdomen_pelvis` found → drop individual `abdomen`/`pelvis`
+3. **Score region overlap** via a 60-entry lookup table (same region = 1.0, unrelated = 0.0, partial overlap = 0.2–0.9)
+
+4. **Score modality compatibility** (same modality = 1.0, MRI↔CT = 0.85, XR↔CT = 0.65, etc.)
+
+5. **Combine:** `score = 0.72 × region_overlap + 0.28 × modality_compat`
+
+6. **Threshold at 0.5** → relevant if score ≥ 0.5
+
+All thresholds and weights are configurable via environment variables (see `config.py`).
+
+### Key deduplication rules applied after region extraction
+
+- `abdomen_pelvis` found → drop individual `abdomen` / `pelvis` tags
 - Specific spine level found → drop generic `spine_whole`
-- `spine_thoracic` found alongside `chest` → drop `chest` (they're distinct)
-- `breast` found alongside `chest` → drop `chest`
-- `cardiac` found alongside `chest` (no vascular) → drop `chest`
-- PET/whole-body → strip spurious `brain`/`lower_extremity` from "skull to thigh"
-- DXA/bone-density → strip spurious `lower_extremity`/`pelvis` hits
-
-**Region overlap scoring** via a curated 60-entry matrix. Key design decisions:
-
-- `cardiac` ↔ `chest`: set to **0.5** (exactly at threshold) → always goes to LLM
-- `vascular_head` ↔ `brain`: set to **0.5** → always goes to LLM
-- `spine_thoracic` ↔ `chest`: set to **0.5** → always goes to LLM
-- `gi_tract` ↔ `chest`: set to **0.5** → always goes to LLM (esophagram sometimes IS relevant to chest CT)
-- `whole_body` ↔ `breast`: **0.35** → bone scan not relevant to mammogram
-- Different specific spine levels: **0.10–0.35**
-- Same region: **1.0** always
-
-**Final score:** `0.72 × region_overlap + 0.28 × modality_compat`
-
-**Confidence gate:** Score ≥ 0.70 or ≤ 0.30 → rule-based only. Middle range → LLM.
-
-**Modality compatibility:** Same modality = 1.0, MRI↔CT = 0.85, XR↔CT = 0.65, breast US↔mammo = 0.80.
-
-### Stage 2 — LLM Fallback (`llm_client.py`)
-
-- Model: **Claude Haiku** (fast, low-cost, accurate for binary classification)
-- All uncertain priors for a case batched into **one API call** (avoids timeout)
-- 30-second timeout per call with graceful rule-based fallback
-- In-memory MD5 cache on `(current_desc, prior_desc)` — no re-scoring on retries
+- `spine_thoracic` alongside `chest` → drop `chest` (distinct studies)
+- `breast` alongside `chest` → drop `chest`
+- `cardiac` alongside `chest` (no vascular) → drop `chest`
+- PET/whole-body → strip spurious `brain` / `lower_extremity` from "skull to thigh"
 
 ---
 
-## Results on Public Eval (27,614 labeled pairs, 996 cases)
+## Data Split Discipline
 
-| Stage | Accuracy | FP | FN |
-|---|---|---|---|
-| Initial code (63 patterns) | 63.4% | — | — |
-| After pattern expansion | 90.5% | 2,278 | 342 |
-| After targeted overlap fixes | 92.6% | 1,801 | 237 |
-| **Estimated with LLM fallback** | **~96.6%** | — | — |
+| Data | Used for |
+|---|---|
+| Public eval JSON (996 cases, 27,614 pairs) | **Tuning only** — regex patterns, overlap matrix values, deduplication rules |
+| Private eval JSON | **Never seen** — final scoring only |
+
+The public eval labels were used iteratively to:
+- Identify missing abbreviations (e.g. `MAM screen`, `US ABDOMINAL`, `NMmyo perf`)
+- Tune overlap scores for ambiguous region pairs (cardiac/chest, vascular_head/brain)
+- Validate deduplication logic
+
+No held-out validation split was used from the public data — all 27,614 pairs were used for tuning. This means the public eval accuracy (92.63%) is optimistic; the private split is the true measure.
+
+---
+
+## Results
+
+| Metric | Value |
+|---|---|
+| Public eval accuracy | **92.63%** (25,578 / 27,614) |
+| True Positives | 6,330 |
+| True Negatives | 19,248 |
+| False Positives | 1,799 |
+| False Negatives | 237 |
+| Avg latency (996 cases) | ~8 seconds |
+| External API calls | None |
 
 Label distribution: 23.8% relevant, 76.2% not relevant.
 
@@ -85,60 +68,61 @@ Label distribution: 23.8% relevant, 76.2% not relevant.
 
 ## Experiments
 
-### Experiment 1 — Pattern Coverage Analysis
+### Experiment 1 — Pattern coverage
+Initial regex patterns gave 63.4% accuracy. The real dataset uses heavy abbreviations not in the initial patterns (`MAM screen`, `LUM TTE`, `DIGITAL SCREENER W CAD`, `NMmyo perf`, `US ABDOMINAL`). Adding these raised accuracy to 90.5%.
 
-Ran full eval, found `63%` accuracy. Identified that real data uses abbreviations not covered by initial patterns:
+### Experiment 2 — Overlap score calibration
+Studied FP/FN pairs to tune overlap scores:
+- `cardiac` ↔ `chest` set to 0.5 (both FP and FN cases exist in data — genuinely ambiguous)
+- `breast` ↔ `chest` set to 0.0 (mammogram is never relevant to chest CT)
+- `whole_body` ↔ `breast` set to 0.35 (PET scan not relevant to mammogram)
+- Adjacent spine levels (cervical↔thoracic, thoracic↔lumbar) set to 0.25 so MRI modality bonus doesn't push above threshold
 
-- `MAM screen BI with tomo` → needed `mam\b` pattern
-- `MAMMOGRAPHY SCREENING BILATERAL` → needed `mammography` keyword
-- `US ABDOMINAL` → needed `us abdominal` / `abdominal\b`
-- `NMmyo perf str/rest SPEC` → needed `myo perf` / `nmmyo`
-- `LUM TTE W/DOPPL COMPLETE` → needed `lum tte` / `tte\b`
-- `DIGITAL SCREENER W CAD` → needed `digital screener` for breast
-- `BIOPSY - ABDOMINL MASS` → needed `abdominl` typo match for abdomen
+### Experiment 3 — LLM fallback (abandoned)
+Tested Groq Llama 3.1 8B as a fallback for ambiguous pairs (score 0.43–0.57).
+Result: 92.53% — worse than rule-only (92.62%). The model flipped too many already-correct rule predictions.
+Decision: removed LLM entirely. The rule-based system is more reliable for this task.
 
-**Result:** 63% → 90.5% from pattern fixes alone.
+### Experiment 4 — Weight tuning
+Tested region:modality weight ratios of 60:40, 70:30, 72:28, 80:20.
+72:28 gave best results — region overlap dominates but modality still breaks ties.
 
-### Experiment 2 — Overlap Score Calibration
+---
 
-Studied which pairs were FP vs FN to find the right overlap scores:
+## Configuration
 
-- `cardiac` ↔ `chest`: dataset has BOTH relevant and not-relevant cases (echo sometimes compared to chest CT, sometimes not). Set to 0.5 → LLM decides.
-- `vascular_head` ↔ `brain`: carotid US sometimes compared to CT head, sometimes not. Set to 0.5 → LLM decides.
-- `spine_thoracic` ↔ `chest`: chest X-ray is sometimes pulled for thoracic spine reading. Set to 0.5 → LLM.
-- `whole_body` ↔ `breast`: PET scan is NOT relevant to mammogram (0.35).
-- `bone_density` ↔ `pelvis`: DXA is NOT relevant to pelvic US (0.25).
+All runtime settings are in `config.py` and overridable via environment variables:
 
-**Result:** 90.5% → 92.6%.
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | 8080 | Server port |
+| `WORKERS` | 4 | Gunicorn worker count |
+| `TIMEOUT` | 120 | Request timeout (seconds) |
+| `RELEVANCE_THRESHOLD` | 0.5 | Score cutoff for relevant |
+| `REGION_WEIGHT` | 0.72 | Weight of region overlap score |
+| `MODALITY_WEIGHT` | 0.28 | Weight of modality compatibility score |
 
-### Experiment 3 — LLM Impact Estimate
+---
 
-Uncertain pairs (score 0.30–0.70): 5,041 total, 1,304 currently wrong.
-LLM at 85% accuracy on these would fix ~1,108 errors → **~96.6% total accuracy**.
+## Running Tests
 
-### Experiment 4 — Confidence Threshold
+```bash
+python test_classifier.py
+```
 
-Tested thresholds for routing to LLM:
-- ≥0.75 / ≤0.25: fewer LLM calls, but misses some borderline correct pairs
-- ≥0.70 / ≤0.30: good balance — catches ambiguous region pairs without over-routing
-- ≥0.65 / ≤0.35: too many LLM calls, risks timeout on large batches
-
-**Chose 0.70/0.30.**
+Runs 60 unit tests covering:
+- Region extraction for all 25 region types
+- All deduplication rules
+- Modality extraction
+- End-to-end relevance predictions for known pairs
+- Score sanity checks (same study = 1.0, unrelated < 0.3)
 
 ---
 
 ## Next Improvements
 
-### Short-term (1–2 days)
-1. **Logistic regression on public labels** — train a simple LR on `[region_overlap, modality_compat, days_since_prior, same_modality_bool]` features using the 27,614 labeled pairs to tune weights and threshold automatically
-2. **Date recency feature** — priors > 5 years old slightly less relevant; add `recency_score = exp(-years/3)`
-3. **Exact description match cache** — pre-compute results for all 827 unique descriptions seen in training
-
-### Medium-term
-4. **Medical text embeddings** — encode descriptions with BioLinkBERT / ClinicalBERT, use cosine similarity as additional feature for unknown/rare descriptions
-5. **CPT code integration** — if CPT codes available, perfect region/modality classification with no parsing
-6. **Study type ontology** — formalize the region hierarchy (e.g. vascular_head IS-A brain_region) for better transitivity
-
-### Long-term
-7. **Reader preference modeling** — different subspecialties have different relevance norms; model per-reader or per-department preferences
-8. **Report-text NER** — if prior report text available, extract anatomical findings to improve relevance beyond study type
+1. **Train overlap weights** — use logistic regression on the public labels to learn optimal region/modality weights rather than hand-tuning
+2. **Date recency feature** — priors > 5 years old are less relevant; add `exp(-years/3)` decay factor
+3. **Medical text embeddings** — encode descriptions with BioLinkBERT for semantic similarity on rare/unseen study types
+4. **Held-out validation split** — reserve 20% of public data for validation so tuning decisions are evaluated on unseen data
+5. **Larger LLM** — Llama 70B or Claude Haiku would likely improve over rule-only on ambiguous pairs (Llama 8B did not)

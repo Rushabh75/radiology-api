@@ -3,6 +3,7 @@ Rule-based relevance classifier for radiology prior studies.
 Tuned against 27,614 labeled pairs from the public eval set.
 """
 import re
+from config import RELEVANCE_THRESHOLD, REGION_WEIGHT, MODALITY_WEIGHT
 
 REGION_PATTERNS = {
     # ── Brain / Head ──────────────────────────────────────────────────────────
@@ -396,7 +397,7 @@ def region_overlap_score(regions_a: list, regions_b: list) -> float:
         adj = {frozenset({"spine_cervical", "spine_thoracic"}),
                frozenset({"spine_thoracic", "spine_lumbar"})}
         if frozenset(specific_a | specific_b) in adj:
-            return 0.35
+            return 0.25
         return 0.1
 
     best = 0.0
@@ -432,7 +433,7 @@ def rule_based_score(current_desc: str, prior_desc: str) -> tuple:
 
     region_score = region_overlap_score(cur_regions, pri_regions)
     mod_score = modality_compat_score(cur_mod, pri_mod)
-    combined = 0.72 * region_score + 0.28 * mod_score
+    combined = REGION_WEIGHT * region_score + MODALITY_WEIGHT * mod_score
 
     debug = {
         "cur_regions": cur_regions, "pri_regions": pri_regions,
@@ -451,4 +452,4 @@ def is_confident(score: float) -> bool:
 
 def predict_relevance(current_desc: str, prior_desc: str) -> tuple:
     score, debug = rule_based_score(current_desc, prior_desc)
-    return score >= 0.5, score, debug
+    return score >= RELEVANCE_THRESHOLD, score, debug

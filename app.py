@@ -8,6 +8,7 @@ import time
 import uuid
 from flask import Flask, request, jsonify
 from classifier import rule_based_score
+from config import RELEVANCE_THRESHOLD
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,8 +17,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-THRESHOLD = 0.5
 
 
 def process_case(case: dict) -> list:
@@ -33,7 +32,7 @@ def process_case(case: dict) -> list:
         predictions.append({
             "case_id": case_id,
             "study_id": prior_id,
-            "predicted_is_relevant": score >= THRESHOLD,
+            "predicted_is_relevant": score >= RELEVANCE_THRESHOLD,
         })
     return predictions
 
@@ -60,7 +59,6 @@ def predict():
             all_predictions.extend(process_case(case))
         except Exception as e:
             log.error(f"[{req_id}] Error on case {case_id}: {e}", exc_info=True)
-            # Never skip — emit False for all priors in failed case
             for prior in case.get("prior_studies", []):
                 all_predictions.append({
                     "case_id": str(case_id),
@@ -84,4 +82,5 @@ def root():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    from config import PORT
+    app.run(host="0.0.0.0", port=PORT, debug=False)
